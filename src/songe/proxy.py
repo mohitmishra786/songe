@@ -675,6 +675,85 @@ def create_app(config=None, store=None, client=None, scheduler=None):
         result.raw_headers = headers(upstream.headers.raw, changed=renamer is not None)
         return result
 
+    async def responses(request: Request):
+        """/v1/responses (Codex CLI), served as a chat completion: see
+        responses.py."""
+        from .responses import StreamTranslator, Unsupported, from_chat, to_chat
+
+        if rejected := guard(request):
+            return rejected
+        raw = await request.body()
+        if len(raw) > CAPTURE_LIMIT:
+            return JSONResponse({"error": "Request exceeds the local capture limit"}, 413)
+        try:
+            asked = json.loads(raw)
+            chat, names = to_chat(asked)
+        except (ValueError, Unsupported) as exc:
+            return JSONResponse(
+                {"error": {"message": f"Songe cannot serve this request: {exc}",
+                           "type": "invalid_request_error"}},
+                400,
+            )
+        data = json.dumps(chat, ensure_ascii=False, separators=(",", ":")).encode()
+        kept = [
+            (k, v) for k, v in request.headers.raw
+            if k.lower() not in {b"content-length", b"content-type", b"accept-encoding"}
+        ]
+        # Translated bytes must arrive uncompressed. Codex names its session
+        # session-id; Songe's lesson pins read x-session-affinity.
+        kept += [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(data)).encode()),
+            (b"accept-encoding", b"identity"),
+        ]
+        if "session-id" in request.headers and "x-session-affinity" not in request.headers:
+            kept.append((b"x-session-affinity", request.headers["session-id"].encode()))
+        path = "/v1/chat/completions"
+        scope = {**request.scope, "path": path, "raw_path": path.encode(), "headers": kept}
+        sent = False
+
+        async def receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": data, "more_body": False}
+            return await request.receive()  # the agent leaving
+
+        result = await forward(Request(scope, receive))
+        if not isinstance(result, StreamingResponse) or result.status_code != 200:
+            return result  # Songe's own errors and the server's pass through
+        model = asked.get("model")
+        if not chat.get("stream"):
+            body = bytearray()
+            try:
+                async for chunk in result.body_iterator:
+                    body.extend(chunk)
+            finally:
+                if result.background:
+                    await result.background()
+            try:
+                return JSONResponse(from_chat(json.loads(body), model, names))
+            except (ValueError, AttributeError, TypeError):
+                return JSONResponse(
+                    {"error": {"message": "the model server's answer is not a chat completion",
+                               "type": "upstream_error"}},
+                    502,
+                )
+
+        async def translated():
+            translator = StreamTranslator(model, names)
+            yield translator.start()
+            try:
+                async for chunk in result.body_iterator:
+                    yield translator.feed(chunk)
+            finally:
+                await result.body_iterator.aclose()
+            yield translator.end()
+
+        return StreamingResponse(
+            translated(), media_type="text/event-stream", background=result.background
+        )
+
     assets = Path(__file__).parent / "ui"
 
     def stamped_index(page="next.html", names=("next.js", "next.css")):
@@ -723,6 +802,7 @@ def create_app(config=None, store=None, client=None, scheduler=None):
                     ("/v1/embeddings", ["POST"]),
                 )
             ],
+            Route("/v1/responses", responses, methods=["POST"]),
         ],
         lifespan=lifespan,
     )
