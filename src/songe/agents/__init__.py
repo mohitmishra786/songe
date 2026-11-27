@@ -12,10 +12,11 @@ from pathlib import Path
 from ..storage import atomic_write, write_json
 from .aider import Aider
 from .base import JSON, NotEditable, codec_named
+from .continue_ import Continue
 from .opencode import OpenCode
 from .pi import Pi
 
-ADAPTERS = (OpenCode(), Pi(), Aider())
+ADAPTERS = (OpenCode(), Pi(), Aider(), Continue())
 
 # A file Songe will not rewrite (the older name, still used by callers).
 NotPlainJSON = NotEditable
@@ -84,6 +85,11 @@ def proposed(config, home=None, default=None, opencode_v2=False, root=None):
     changes = []
     for adapter in ADAPTERS:
         loaded, skipped = [], None
+        reason = adapter.skip_reason(home)
+        if reason:
+            for path, _ in adapter.files(home):
+                skip_note(adapter, path, config, default, opencode_v2, reason)
+            continue
         for path, codec in adapter.files(home):
             original = path.read_bytes() if path.exists() else None
             try:

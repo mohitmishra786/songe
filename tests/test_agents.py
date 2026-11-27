@@ -679,3 +679,167 @@ def test_aider_on_songe_reads_its_default_model(tmp_path, monkeypatch):
     assert agents.routing(home) == {"aider": True}
     monkeypatch.setenv("AIDER_MODEL", "gpt-4o")  # the environment wins
     assert agents.routing(home) == {"aider": False}
+
+
+CONTINUE_DEFAULT = b"name: Main Config\nversion: 1.0.0\nschema: v1\nmodels: []\n"
+
+
+def continue_home(tmp_path, monkeypatch, raw=CONTINUE_DEFAULT):
+    monkeypatch.delenv("CONTINUE_GLOBAL_DIR", raising=False)
+    home = tmp_path / "home"
+    (home / ".continue").mkdir(parents=True)  # Continue has started once
+    if raw is not None:
+        (home / ".continue/config.yaml").write_bytes(raw)
+    root = tmp_path / "songe"
+    root.mkdir()
+    return home, home / ".continue/config.yaml", root
+
+
+def test_continue_gets_songe_models_after_the_users_and_restore_undoes_them(
+    tmp_path, config, monkeypatch
+):
+    import yaml
+
+    original = (
+        b"name: Mine\nversion: 1.0.0\nschema: v1\nmodels:\n"
+        b"- name: Qwen local\n  provider: ollama\n  model: qwen3\n"
+        b"rules:\n- Be brief\n"
+    )
+    home, path, root = continue_home(tmp_path, monkeypatch, original)
+    changes = agents.proposed(config, home)
+    assert [p for p, *_ in changes] == [path]
+    agents.apply(changes, root)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert document["rules"] == ["Be brief"]
+    # The user's model stays first, so Continue's default stays theirs.
+    assert [m["name"] for m in document["models"]] == ["Qwen local", config.public_model]
+    assert document["models"][1] == {
+        "name": config.public_model,
+        "provider": "openai",
+        "model": config.public_model,
+        "apiBase": "http://127.0.0.1:7613/v1",
+        "apiKey": "local",
+        "capabilities": ["tool_use"],
+        "defaultCompletionOptions": {"contextLength": 8192},
+    }
+    assert not agents.proposed(config, home)  # idempotent
+    assert agents.routing(home)["continue"] is False
+    manifest = json.loads((root / "agent-backups.json").read_text(encoding="utf-8"))
+    assert manifest[str(path)]["codec"] == "yaml-section:models:name"
+    assert agents.restore(root) == []
+    assert path.read_bytes() == original
+
+
+def test_continue_user_edits_survive_uninstall(tmp_path, config, monkeypatch):
+    import yaml
+
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    agents.apply(agents.proposed(config, home), root)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["models"].append({"name": "Later", "provider": "ollama", "model": "llama3"})
+    document["models"][0]["roles"] = ["chat"]
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert agents.restore(root) == []
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    # Songe's fields go; the role the user set, and their own model, stay.
+    assert document["models"] == [
+        {"name": config.public_model, "roles": ["chat"]},
+        {"name": "Later", "provider": "ollama", "model": "llama3"},
+    ]
+
+
+def test_continue_entries_follow_the_servers_context(tmp_path, config, monkeypatch):
+    import yaml
+
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    agents.apply(agents.proposed(config, home), root)
+    config.served_contexts = {config.public_model: 32768}
+    assert agents.refresh_limits(config, home, root=root) == [path]
+    entry = yaml.safe_load(path.read_text(encoding="utf-8"))["models"][0]
+    assert entry["defaultCompletionOptions"] == {"contextLength": 32768}
+    assert agents.restore(root) == []
+    assert path.read_bytes() == CONTINUE_DEFAULT
+
+
+def test_continue_without_config_yaml_gets_one_and_uninstall_removes_it(
+    tmp_path, config, monkeypatch
+):
+    home, path, root = continue_home(tmp_path, monkeypatch, raw=None)
+    agents.apply(agents.proposed(config, home), root)
+    assert path.read_bytes().startswith(CONTINUE_DEFAULT.split(b"models")[0])
+    assert agents.restore(root) == []
+    assert not path.exists()
+
+
+def test_continue_still_on_config_json_is_left_alone(tmp_path, config, monkeypatch, capsys):
+    # Continue reads config.json only while there is no config.yaml: writing
+    # one would replace the user's whole configuration.
+    home, path, _ = continue_home(tmp_path, monkeypatch, raw=None)
+    (home / ".continue/config.json").write_text('{"models": []}', encoding="utf-8")
+    assert agents.proposed(config, home) == []
+    note = capsys.readouterr().err
+    assert f"Skipped {path} · Continue still reads config.json" in note
+    assert "apiBase: http://127.0.0.1:7613/v1" in note
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "raw,why",
+    [
+        (CONTINUE_DEFAULT + b"# mine\n", "it has comments"),
+        (b"models:\n- uses: anthropic/claude-sonnet\n", "its models is not a list of entries with a name"),
+        (b"models:\n- name: a\n- name: a\n", "two entries named a"),
+        (b"- name: a\n", "it is not a YAML mapping"),
+        (b"models: {}\n", "its models is not a list"),
+    ],
+)
+def test_continue_config_songe_cannot_rewrite_is_left_alone(
+    tmp_path, config, monkeypatch, capsys, raw, why
+):
+    home, path, _ = continue_home(tmp_path, monkeypatch, raw)
+    assert agents.proposed(config, home) == []
+    assert why in capsys.readouterr().err
+    assert path.read_bytes() == raw
+
+
+def test_continue_on_songe_reads_the_picked_chat_model(tmp_path, config, monkeypatch):
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    assert agents.routing(home) == {"continue": False}
+    agents.apply(agents.proposed(config, home), root)
+    # Nothing picked yet: the first model listed is the default.
+    assert agents.routing(home) == {"continue": True}
+    picked = home / ".continue/index/globalContext.json"
+    picked.parent.mkdir()
+    picked.write_text(
+        json.dumps({"selectedModelsByProfileId": {"local": {"chat": "GPT-4o"}}}),
+        encoding="utf-8",
+    )
+    assert agents.routing(home) == {"continue": False}
+    picked.write_text(
+        json.dumps({"selectedModelsByProfileId": {"local": {"chat": config.public_model}}}),
+        encoding="utf-8",
+    )
+    assert agents.routing(home) == {"continue": True}
+
+
+def test_continue_follows_its_global_dir(tmp_path, config, monkeypatch):
+    elsewhere = tmp_path / "custom"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CONTINUE_GLOBAL_DIR", str(elsewhere))
+    home = tmp_path / "home"
+    home.mkdir()
+    changes = agents.proposed(config, home)
+    assert [p for p, *_ in changes] == [elsewhere / "config.yaml"]
+
+
+def test_doctor_and_plan_name_continue(tmp_path, config, monkeypatch):
+    from songe import cli
+
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    changes = agents.proposed(config, home)
+    assert {cli.agent_name(p) for p, *_ in changes} == {"continue"}
+    agents.apply(changes, root)
+    adapter = agents.adapter_for(path)
+    assert adapter.status(path, agents.load(path), config) == "configured"
+    assert agents.adapter_for(tmp_path / "project/config.yaml") is None
+    assert "continue" not in agents.KNOWN

@@ -34,6 +34,51 @@ class JSONCodec:
         return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode()
 
 
+def read_yaml(raw):
+    """A YAML document Songe may rewrite: UTF-8, valid, and without comments,
+    which dumping would drop."""
+    import yaml
+
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else (raw or "")
+    except UnicodeDecodeError:
+        raise NotEditable("it is not UTF-8") from None
+    # A comment is the user's own writing; dumping would drop it.
+    if re.search(r"(^|\s)#", text):
+        raise NotEditable("it has comments")
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise NotEditable("it is not valid YAML") from None
+
+
+def keyed(items, key, what="it"):
+    """A YAML list of entries as a map keyed by one field."""
+    # An empty file is an empty list; `{}`, `0` or `false` is not one.
+    items = [] if items is None else items
+    if not isinstance(items, list) or not all(
+        isinstance(item, dict) and isinstance(item.get(key), str) for item in items
+    ):
+        raise NotEditable(f"{what} is not a list of entries with a {key}")
+    names = [item[key] for item in items]
+    repeated = next((n for n in names if names.count(n) > 1), None)
+    if repeated is not None:
+        # Keyed by name, one of them would be lost for good.
+        raise NotEditable(f"it has two entries named {repeated}")
+    return {item[key]: item for item in items}
+
+
+def listed(entries, key):
+    return [{key: name, **{k: v for k, v in entry.items() if k != key}}
+            for name, entry in entries.items()]
+
+
+def dump_yaml(data):
+    import yaml
+
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
+
+
 class YAMLListCodec:
     """A YAML list of entries, read as a map keyed by one field, so field-level
     edit tracking applies (Aider's model settings, keyed by `name`)."""
@@ -43,39 +88,38 @@ class YAMLListCodec:
         self.name = f"yaml-list:{key}"
 
     def load(self, raw):
-        import yaml
-
-        try:
-            text = raw.decode("utf-8") if isinstance(raw, bytes) else (raw or "")
-        except UnicodeDecodeError:
-            raise NotEditable("it is not UTF-8") from None
-        # A comment is the user's own writing; dumping would drop it.
-        if re.search(r"(^|\s)#", text):
-            raise NotEditable("it has comments")
-        try:
-            items = yaml.safe_load(text)
-        except yaml.YAMLError:
-            raise NotEditable("it is not valid YAML") from None
-        # An empty file is an empty list; `{}`, `0` or `false` is not one.
-        items = [] if items is None else items
-        if not isinstance(items, list) or not all(
-            isinstance(item, dict) and isinstance(item.get(self.key), str)
-            for item in items
-        ):
-            raise NotEditable(f"it is not a list of entries with a {self.key}")
-        names = [item[self.key] for item in items]
-        repeated = next((n for n in names if names.count(n) > 1), None)
-        if repeated is not None:
-            # Keyed by name, one of them would be lost for good.
-            raise NotEditable(f"it has two entries named {repeated}")
-        return {item[self.key]: item for item in items}
+        return keyed(read_yaml(raw), self.key)
 
     def dump(self, data):
-        import yaml
+        return dump_yaml(listed(data, self.key))
 
-        items = [{self.key: key, **{k: v for k, v in entry.items() if k != self.key}}
-                 for key, entry in data.items()]
-        return yaml.safe_dump(items, sort_keys=False, allow_unicode=True).encode()
+
+class YAMLSectionCodec:
+    """A YAML mapping whose `section` is a list of entries keyed by one field
+    (Continue's config.yaml: `models`, keyed by `name`). The rest of the
+    document is kept as it is."""
+
+    def __init__(self, section, key):
+        self.section, self.key = section, key
+        self.name = f"yaml-section:{section}:{key}"
+
+    def load(self, raw):
+        document = read_yaml(raw)
+        document = {} if document is None else document
+        if not isinstance(document, dict):
+            raise NotEditable("it is not a YAML mapping")
+        if self.section not in document:
+            return document
+        return {
+            **document,
+            self.section: keyed(document[self.section], self.key, f"its {self.section}"),
+        }
+
+    def dump(self, data):
+        data = dict(data)
+        if isinstance(data.get(self.section), dict):
+            data[self.section] = listed(data[self.section], self.key)
+        return dump_yaml(data)
 
 
 JSON = JSONCodec()
@@ -83,11 +127,13 @@ JSON = JSONCodec()
 
 def codec_named(name):
     """The codec a backup manifest entry was written with ("json",
-    "yaml-list:name")."""
+    "yaml-list:name", "yaml-section:models:name")."""
     if name == JSON.name:
         return JSON
     if name.startswith("yaml-list:"):
         return YAMLListCodec(name.split(":", 1)[1])
+    if name.startswith("yaml-section:") and name.count(":") == 2:
+        return YAMLSectionCodec(*name.split(":")[1:])
     # Written by a later Songe: kept as a conflict, never guessed at.
     raise NotEditable(f"it was written with a codec this Songe does not know ({name})")
 
@@ -132,6 +178,10 @@ class Agent:
 
     def after_uninstall(self, home):
         """A note for what uninstall cannot undo, or None."""
+        return None
+
+    def skip_reason(self, home):
+        """Why init must leave all of this harness's files alone, or None."""
         return None
 
     # How the user picks a Songe model there ("choose one with <pick>").
