@@ -153,14 +153,22 @@ def drop_stale(adapter, path, data, root, config):
     if not record:
         return data
     try:
-        written = codec_for(path, record).load(record["written"].encode())
+        codec = codec_for(path, record)
+        written = codec.load(record["written"].encode())
     except NotEditable:
         return data
-    return {
+    # Entries are top-level keys, or those of one section (Continue's models).
+    section = getattr(codec, "section", None)
+    current = data.get(section) if section else data
+    written = written.get(section) if section else written
+    if not isinstance(current, dict) or not isinstance(written, dict):
+        return data
+    kept = {
         key: value
-        for key, value in data.items()
+        for key, value in current.items()
         if not (adapter.stale(path, key, config) and written.get(key) == value)
     }
+    return {**data, section: kept} if section else kept
 
 
 def remove_legacy_models(data, path, root, config, aliases=None):
@@ -379,9 +387,17 @@ def restore(root):
     conflicts = []
     for name, entry in list(manifest.items()):
         path = Path(name)
+        raw = path.read_bytes() if path.exists() else None
+        if raw is None or not raw.strip():
+            # Deleted or emptied since: nothing of Songe's is left in it, and
+            # writing {} would be worse than either (Continue writes its
+            # default only for a missing or blank file).
+            del manifest[name]
+            write_json(manifest_path, manifest)
+            continue
         try:
             codec = codec_for(path, entry)
-            current = codec.load(path.read_bytes()) if path.exists() else {}
+            current = codec.load(raw)
         except NotEditable:
             conflicts.append(name)
             continue
@@ -418,6 +434,9 @@ def restore(root):
                 part = edit["path"][length - 1]
                 if cursor.get(part) == {} and part not in previous:
                     cursor.pop(part)
+        adapter = adapter_for(path)
+        if adapter:
+            current = adapter.restored(path, current, original)
         backup = Path(entry["backup"]) if entry["backup"] else None
         if current == original and not unresolved and not (backup and not backup.exists()):
             if backup:

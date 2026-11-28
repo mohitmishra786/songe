@@ -30,6 +30,17 @@ def folder(home):
     return home / ".continue"
 
 
+# What a model entry needs for Continue to load its config at all.
+REQUIRED = ("provider", "model", "apiBase")
+
+
+def max_tokens(context):
+    """The answer's budget. Continue's extensions use 4096 for a model they
+    do not know and reserve less than that for the answer, so a small
+    window overflows; its CLI refuses half the context or more."""
+    return min(4096, context * 3 // 10)
+
+
 def songe_entries(data):
     models = data.get("models")
     if not isinstance(models, dict):
@@ -73,6 +84,7 @@ class Continue(Agent):
         models = dict(data.get("models") or {})
         for public in exposed(config):
             context = context_for(config, public)
+            new = public not in models
             entry = dict(models.get(public) or {})
             entry.update(
                 name=public,
@@ -81,18 +93,49 @@ class Continue(Agent):
                 apiBase=f"http://127.0.0.1:{config.port}/v1",
                 apiKey="local",
             )
-            # Continue only detects tool calling for model names it knows,
-            # and Agent mode needs it.
-            entry.setdefault("capabilities", ["tool_use"])
-            # maxTokens is left to Continue (35% of the context): its CLI
-            # refuses to run when it is half the context or more.
+            if new:
+                # Continue only detects tool calling for model names it
+                # knows, and Agent mode needs it. Set once: a user who took
+                # it out keeps it out.
+                entry["capabilities"] = ["tool_use"]
             entry["defaultCompletionOptions"] = {
                 **(entry.get("defaultCompletionOptions") or {}),
                 "contextLength": context,
+                "maxTokens": max_tokens(context),
             }
             models[public] = entry
         data["models"] = models
         return data
+
+    def snippet(self, path, config, *, default=None, v2=False):
+        # Only the entries to add to the user's own models list.
+        return {"models": self.configure(path, {}, config)["models"]}
+
+    def stale(self, path, key, config):
+        return str(key).startswith(f"{NAME}/") and key not in exposed(config)
+
+    def restored(self, path, current, original):
+        models = current.get("models")
+        before = original.get("models") or {}
+        if isinstance(models, dict):
+            for name in list(models):
+                entry = models[name]
+                # Songe's entry, with only the user's fields left (roles,
+                # a changed contextLength): Continue rejects an entry
+                # without these, and with it the whole file.
+                if (
+                    name not in before
+                    and str(name).startswith(f"{NAME}/")
+                    and not all(isinstance(entry, dict) and key in entry for key in REQUIRED)
+                ):
+                    del models[name]
+            if not models and "models" not in original:
+                del current["models"]
+        if current != original:
+            # The file stays: without these Continue cannot read it.
+            missing = {k: v for k, v in DOCUMENT.items() if k not in current and k not in original}
+            current = {**missing, **current}
+        return current
 
     def owns(self, path, data):
         return bool(songe_entries(data))

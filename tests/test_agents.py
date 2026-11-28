@@ -720,7 +720,9 @@ def test_continue_gets_songe_models_after_the_users_and_restore_undoes_them(
         "apiBase": "http://127.0.0.1:7613/v1",
         "apiKey": "local",
         "capabilities": ["tool_use"],
-        "defaultCompletionOptions": {"contextLength": 8192},
+        # 30% of the context, at most 4096: under the CLI's half, and small
+        # enough for the extensions' own budget on a small window.
+        "defaultCompletionOptions": {"contextLength": 8192, "maxTokens": 2457},
     }
     assert not agents.proposed(config, home)  # idempotent
     assert agents.routing(home)["continue"] is False
@@ -730,22 +732,137 @@ def test_continue_gets_songe_models_after_the_users_and_restore_undoes_them(
     assert path.read_bytes() == original
 
 
-def test_continue_user_edits_survive_uninstall(tmp_path, config, monkeypatch):
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda entry: entry.update(roles=["chat", "edit"]),
+        lambda entry: entry["defaultCompletionOptions"].update(contextLength=4096),
+        lambda entry: entry.update(apiBase="http://127.0.0.1:9999/v1"),
+    ],
+)
+def test_continue_user_edits_survive_uninstall(tmp_path, config, monkeypatch, edit):
     import yaml
 
     home, path, root = continue_home(tmp_path, monkeypatch)
     agents.apply(agents.proposed(config, home), root)
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
     document["models"].append({"name": "Later", "provider": "ollama", "model": "llama3"})
-    document["models"][0]["roles"] = ["chat"]
+    edit(document["models"][0])
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     assert agents.restore(root) == []
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    # Songe's fields go; the role the user set, and their own model, stay.
-    assert document["models"] == [
-        {"name": config.public_model, "roles": ["chat"]},
-        {"name": "Later", "provider": "ollama", "model": "llama3"},
-    ]
+    # The user's own model stays. Songe's entry goes whole: with only the
+    # user's field left, it would have no provider or model, and Continue
+    # would refuse to load the file at all.
+    assert document == {
+        "name": "Main Config", "version": "1.0.0", "schema": "v1",
+        "models": [{"name": "Later", "provider": "ollama", "model": "llama3"}],
+    }
+
+
+def test_continue_config_songe_wrote_keeps_its_header_once_the_user_adds_to_it(
+    tmp_path, config, monkeypatch
+):
+    import yaml
+
+    home, path, root = continue_home(tmp_path, monkeypatch, raw=None)
+    agents.apply(agents.proposed(config, home), root)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["models"].append({"name": "Mine", "provider": "ollama", "model": "qwen3"})
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert agents.restore(root) == []
+    # name and version are what Continue's schema needs to read the file.
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {
+        "name": "Main Config", "version": "1.0.0", "schema": "v1",
+        "models": [{"name": "Mine", "provider": "ollama", "model": "qwen3"}],
+    }
+
+
+@pytest.mark.parametrize("left", [None, b"", b"  \n"])
+def test_continue_config_deleted_or_emptied_is_left_so(tmp_path, config, monkeypatch, left):
+    # Continue writes its default config only for a missing or blank file;
+    # uninstall writing {} there would leave it unable to start.
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    agents.apply(agents.proposed(config, home), root)
+    if left is None:
+        path.unlink()
+    else:
+        path.write_bytes(left)
+    assert agents.restore(root) == []
+    assert (path.read_bytes() if path.exists() else None) == left
+    assert json.loads((root / "agent-backups.json").read_text(encoding="utf-8")) == {}
+
+
+def test_continue_config_is_read_and_written_as_yaml_1_2(tmp_path, config, monkeypatch):
+    import yaml
+
+    from songe.agents.base import YAMLSectionCodec
+
+    # Plain values YAML 1.1 (PyYAML) reads differently from Continue's 1.2.
+    original = (
+        b"name: Main Config\nversion: 1.0.0\nschema: v1\n"
+        b"base: &base\n  provider: ollama\n"
+        b"models:\n- name: Mine\n  model: qwen3\n  <<: *base\n"
+        b"rules:\n- yes\n- off\n- 0755\n- 1:20\n- 0o17\n- 2026-11-28\n"
+        b"- |\n  First line.\n  Second line.\n"
+    )
+    home, path, root = continue_home(tmp_path, monkeypatch, original)
+    codec = YAMLSectionCodec("models", "name")
+    document = codec.load(original)
+    assert document["rules"] == ["yes", "off", 755, "1:20", 15, "2026-11-28",
+                                 "First line.\nSecond line.\n"]
+    # << is a plain key in 1.2: the entry is not merged.
+    assert document["models"]["Mine"] == {"name": "Mine", "model": "qwen3", "<<": {"provider": "ollama"}}
+    agents.apply(agents.proposed(config, home), root)
+    written = path.read_bytes()
+    assert codec.load(written)["rules"] == document["rules"]
+    assert codec.load(written)["models"]["Mine"] == document["models"]["Mine"]
+    # Strings either version would read as something else are quoted, and a
+    # multi-line string stays a block.
+    assert b"- 'yes'\n- 'off'\n- 755\n- '1:20'\n- 15\n- '2026-11-28'\n- |\n  First line.\n" in written
+    assert yaml.safe_load(written)["rules"][:2] == ["yes", "off"]
+    assert agents.restore(root) == []
+    assert path.read_bytes() == original
+
+
+def test_continue_strings_1_2_reads_as_numbers_are_quoted():
+    from songe.agents.base import YAMLSectionCodec
+
+    codec = YAMLSectionCodec("models", "name")
+    data = {"rules": ["0o17", "0x1F", ".inf", "True", "~", "null", "yes", "1_000"]}
+    assert codec.load(codec.dump(data)) == data
+    assert b"- '0o17'\n- '0x1F'\n" in codec.dump(data)
+
+
+def test_continue_entries_are_set_once_and_renamed_ones_go(tmp_path, config, monkeypatch):
+    import yaml
+
+    home, path, root = continue_home(tmp_path, monkeypatch)
+    agents.apply(agents.proposed(config, home), root)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    del document["models"][0]["capabilities"]
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    config.served_contexts = {config.public_model: 4096}
+    assert agents.refresh_limits(config, home, root=root) == [path]
+    entry = yaml.safe_load(path.read_text(encoding="utf-8"))["models"][0]
+    assert "capabilities" not in entry  # taken out by the user, kept out
+    assert entry["defaultCompletionOptions"] == {"contextLength": 4096, "maxTokens": 1228}
+    # A model Songe no longer serves: its unchanged entry goes.
+    old = config.public_model
+    config.public_model = "songe/renamed"
+    config.exposed_models = ["songe/renamed"]
+    agents.apply(agents.proposed(config, home, root=root), root)
+    names = [m["name"] for m in yaml.safe_load(path.read_text(encoding="utf-8"))["models"]]
+    assert names == ["songe/renamed"] and old not in names
+
+
+def test_continue_snippet_is_only_the_models_to_add(tmp_path, config, monkeypatch, capsys):
+    import yaml
+
+    home, path, _ = continue_home(tmp_path, monkeypatch, CONTINUE_DEFAULT + b"# mine\n")
+    assert agents.proposed(config, home) == []
+    snippet = capsys.readouterr().err.split("add this by hand:\n", 1)[1]
+    assert list(yaml.safe_load(snippet)) == ["models"]
 
 
 def test_continue_entries_follow_the_servers_context(tmp_path, config, monkeypatch):
@@ -756,7 +873,7 @@ def test_continue_entries_follow_the_servers_context(tmp_path, config, monkeypat
     config.served_contexts = {config.public_model: 32768}
     assert agents.refresh_limits(config, home, root=root) == [path]
     entry = yaml.safe_load(path.read_text(encoding="utf-8"))["models"][0]
-    assert entry["defaultCompletionOptions"] == {"contextLength": 32768}
+    assert entry["defaultCompletionOptions"] == {"contextLength": 32768, "maxTokens": 4096}
     assert agents.restore(root) == []
     assert path.read_bytes() == CONTINUE_DEFAULT
 

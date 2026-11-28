@@ -6,6 +6,7 @@ recording and undoing the edits stay in agents/__init__.py for all of them,
 and work on any file a codec can read as a tree.
 """
 
+import functools
 import json
 import re
 
@@ -34,9 +35,50 @@ class JSONCodec:
         return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode()
 
 
-def read_yaml(raw):
+@functools.cache
+def yaml12():
+    """(loader, dumper) for YAML 1.2's core schema, which Continue reads
+    (PyYAML reads 1.1: there, yes/on/off are booleans, 0755 is 493, 1:20 is
+    80 and << merges mappings; in 1.2 they are strings and a plain key)."""
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    class Dumper(yaml.SafeDumper):
+        pass
+
+    Loader.yaml_implicit_resolvers = {}
+    core = [
+        ("tag:yaml.org,2002:null", r"^(?:~|null|Null|NULL|)$", "~nN"),
+        ("tag:yaml.org,2002:bool", r"^(?:true|True|TRUE|false|False|FALSE)$", "tTfF"),
+        ("tag:yaml.org,2002:int", r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$", "-+0123456789"),
+        (
+            "tag:yaml.org,2002:float",
+            r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
+            r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$",
+            "-+0123456789.",
+        ),
+    ]
+    for tag, pattern, first in core:
+        Loader.add_implicit_resolver(tag, re.compile(pattern), list(first) + ([""] if tag.endswith("null") else []))
+        # A string either version reads as something else is quoted.
+        Dumper.add_implicit_resolver(tag, re.compile(pattern), list(first))
+
+    def integer(loader, node):
+        value = loader.construct_scalar(node)
+        return int(value, 0) if value[:2] in ("0o", "0x") else int(value, 10)
+
+    Loader.add_constructor("tag:yaml.org,2002:int", integer)
+    Loader.add_constructor("tag:yaml.org,2002:bool", lambda loader, node: loader.construct_scalar(node).lower() == "true")
+    # Without the merge resolver, << is a plain key; it must not be flattened.
+    Loader.flatten_mapping = lambda self, node: None
+    return Loader, Dumper
+
+
+def read_yaml(raw, core12=False):
     """A YAML document Songe may rewrite: UTF-8, valid, and without comments,
-    which dumping would drop."""
+    which dumping would drop. core12 reads it as YAML 1.2 does."""
     import yaml
 
     try:
@@ -47,7 +89,7 @@ def read_yaml(raw):
     if re.search(r"(^|\s)#", text):
         raise NotEditable("it has comments")
     try:
-        return yaml.safe_load(text)
+        return yaml.load(text, Loader=yaml12()[0]) if core12 else yaml.safe_load(text)
     except yaml.YAMLError:
         raise NotEditable("it is not valid YAML") from None
 
@@ -73,10 +115,19 @@ def listed(entries, key):
             for name, entry in entries.items()]
 
 
-def dump_yaml(data):
+def dump_yaml(data, core12=False):
     import yaml
 
-    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
+    class Dumper(yaml12()[1] if core12 else yaml.SafeDumper):
+        pass
+
+    def text(dumper, value):
+        # A multi-line string stays a block (|), as people write them.
+        style = "|" if "\n" in value else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+    Dumper.add_representer(str, text)
+    return yaml.dump(data, Dumper=Dumper, sort_keys=False, allow_unicode=True).encode()
 
 
 class YAMLListCodec:
@@ -95,16 +146,16 @@ class YAMLListCodec:
 
 
 class YAMLSectionCodec:
-    """A YAML mapping whose `section` is a list of entries keyed by one field
-    (Continue's config.yaml: `models`, keyed by `name`). The rest of the
-    document is kept as it is."""
+    """A YAML 1.2 mapping whose `section` is a list of entries keyed by one
+    field (Continue's config.yaml: `models`, keyed by `name`). The rest of
+    the document is kept as it is."""
 
     def __init__(self, section, key):
         self.section, self.key = section, key
         self.name = f"yaml-section:{section}:{key}"
 
     def load(self, raw):
-        document = read_yaml(raw)
+        document = read_yaml(raw, core12=True)
         document = {} if document is None else document
         if not isinstance(document, dict):
             raise NotEditable("it is not a YAML mapping")
@@ -119,7 +170,7 @@ class YAMLSectionCodec:
         data = dict(data)
         if isinstance(data.get(self.section), dict):
             data[self.section] = listed(data[self.section], self.key)
-        return dump_yaml(data)
+        return dump_yaml(data, core12=True)
 
 
 JSON = JSONCodec()
@@ -183,6 +234,12 @@ class Agent:
     def skip_reason(self, home):
         """Why init must leave all of this harness's files alone, or None."""
         return None
+
+    def restored(self, path, current, original):
+        """`current` once uninstall has undone Songe's edits, made right for
+        the harness where undoing them field by field is not (`original`
+        is the file before Songe, {} when there was none)."""
+        return current
 
     # How the user picks a Songe model there ("choose one with <pick>").
     pick = "a Songe model"
