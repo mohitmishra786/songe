@@ -20,6 +20,9 @@ import uuid
 # multi_agent_v1) gets its namespace in front, and the call is mapped back.
 SEPARATOR = "__"
 
+# Chat finish reasons that leave a response incomplete, and why.
+INCOMPLETE = {"length": "max_output_tokens", "content_filter": "content_filter"}
+
 
 class Unsupported(ValueError):
     """A request this translation cannot serve faithfully."""
@@ -29,6 +32,8 @@ def text_of(content):
     """The text of a message's content: a string, or a list of parts."""
     if isinstance(content, str):
         return content
+    if content is not None and not isinstance(content, list):
+        raise Unsupported("a message's content must be a string or a list of parts")
     return "".join(
         part.get("text") or ""
         for part in content or ()
@@ -58,16 +63,30 @@ def output_text(output):
     return output if isinstance(output, str) else text_of(output)
 
 
+def joined(namespace, name):
+    return f"{namespace}{SEPARATOR}{name}" if namespace else name
+
+
 def tools_for_chat(tools):
-    """(chat tools, {chat name: (kind, namespace, name)})."""
-    chat, names = [], {}
+    """(chat tools, {chat name: (kind, namespace, name)}).
+
+    A plain tool named a__b and tool b of namespace a would both be a__b;
+    the later one is renamed (a__b_2), so every call maps back to its tool."""
+    chat, names, taken = [], {}, set()
 
     def add(tool, namespace=None):
         kind = tool.get("type")
         name = tool.get("name")
         if kind not in ("function", "custom") or not isinstance(name, str):
             return  # hosted tools: nothing local runs them
-        flat = f"{namespace}{SEPARATOR}{name}" if namespace else name
+        if (namespace, name) in taken:
+            return  # the same tool twice: the first one stands
+        taken.add((namespace, name))
+        flat = base = joined(namespace, name)
+        number = 1
+        while flat in names:
+            number += 1
+            flat = f"{base}_{number}"
         if kind == "function":
             parameters = tool.get("parameters") or {"type": "object", "properties": {}}
         else:
@@ -88,17 +107,44 @@ def tools_for_chat(tools):
         if not isinstance(tool, dict):
             continue
         if tool.get("type") == "namespace":
-            for inner in tool.get("tools") or ():
+            inner_tools = tool.get("tools") or []
+            if not isinstance(inner_tools, list) or not isinstance(tool.get("name"), str):
+                raise Unsupported("a namespace needs a name and a list of tools")
+            for inner in inner_tools:
                 if isinstance(inner, dict):
-                    add(inner, tool.get("name"))
+                    add(inner, tool["name"])
         else:
             add(tool)
     return chat, names
 
 
-def flat_name(item):
+def chat_names(names):
+    """{(namespace, name): chat name}, the other way round."""
+    return {(namespace, name): flat for flat, (_, namespace, name) in names.items()}
+
+
+def flat_name(item, back):
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        raise Unsupported(f"a {item.get('type') or 'tool'} item has no name")
     namespace = item.get("namespace")
-    return f"{namespace}{SEPARATOR}{item['name']}" if namespace else item["name"]
+    return back.get((namespace, name)) or joined(namespace, name)
+
+
+def reasoning_text(item):
+    """The readable text of a reasoning item; encrypted reasoning has none."""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part.get("text") or ""
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "reasoning_text"
+    )
+
+
+def new_call_id():
+    return f"call_{uuid.uuid4().hex[:24]}"
 
 
 def to_chat(body):
@@ -108,24 +154,46 @@ def to_chat(body):
     if body.get("previous_response_id"):
         # Songe keeps no responses: the agent must send the whole conversation.
         raise Unsupported("previous_response_id needs stored responses; send store: false")
+    tools, names = tools_for_chat(body.get("tools"))
+    back = chat_names(names)
+    # Chat templates know system, not developer, and many (Qwen3.5's) refuse
+    # a system message anywhere but first. The instructions and the developer
+    # messages before the conversation are one system message; one that
+    # comes later (Codex adds them mid-conversation) is sent as the user's.
+    system = [text_of(body["instructions"])] if body.get("instructions") else []
     messages = []
-    if body.get("instructions"):
-        messages.append({"role": "system", "content": text_of(body["instructions"])})
+    thought = ""  # readable reasoning, for the assistant turn it belongs to
+
+    def assistant_turn(message, extend=False):
+        nonlocal thought
+        if thought:
+            earlier = message.get("reasoning_content")
+            message["reasoning_content"] = f"{earlier}\n\n{thought}" if earlier else thought
+            thought = ""
+        if not extend:
+            messages.append(message)
+
     items = body.get("input")
     if isinstance(items, str):
         items = [{"type": "message", "role": "user", "content": items}]
+    if items is not None and not isinstance(items, list):
+        raise Unsupported("input must be a string or a list of items")
     for item in items or ():
         if not isinstance(item, dict):
             continue
         kind = item.get("type", "message")
         if kind == "message":
             role = item.get("role", "user")
-            # Chat templates know system, not developer.
-            role = "system" if role == "developer" else role
             content = item.get("content")
-            messages.append(
-                {"role": role, "content": text_of(content) if role == "assistant" else chat_content(content)}
-            )
+            if role in ("system", "developer"):
+                if not messages:
+                    system.append(text_of(content))
+                    continue
+                role = "user"
+            if role == "assistant":
+                assistant_turn({"role": role, "content": text_of(content)})
+            else:
+                messages.append({"role": role, "content": chat_content(content)})
         elif kind in ("function_call", "custom_tool_call"):
             arguments = (
                 item.get("arguments") or "{}"
@@ -135,16 +203,15 @@ def to_chat(body):
             call = {
                 "id": item.get("call_id") or item.get("id") or "",
                 "type": "function",
-                "function": {"name": flat_name(item), "arguments": arguments},
+                "function": {"name": flat_name(item, back), "arguments": arguments},
             }
             previous = messages[-1] if messages else None
             # A reply's text and its calls, or several calls, are one turn.
-            if previous and previous["role"] == "assistant" and "tool_calls" not in previous:
-                previous["tool_calls"] = [call]
-            elif previous and previous["role"] == "assistant":
-                previous["tool_calls"].append(call)
+            if previous and previous["role"] == "assistant":
+                previous.setdefault("tool_calls", []).append(call)
+                assistant_turn(previous, extend=True)
             else:
-                messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                assistant_turn({"role": "assistant", "content": None, "tool_calls": [call]})
         elif kind in ("function_call_output", "custom_tool_call_output"):
             messages.append(
                 {
@@ -153,17 +220,23 @@ def to_chat(body):
                     "content": output_text(item.get("output")),
                 }
             )
-        # Reasoning items (encrypted, for OpenAI's own models) and hosted
-        # tool calls have nothing a local model can read.
+        elif kind == "reasoning":
+            # Reasoning Songe returned is readable: it goes back with its
+            # turn, so the model keeps its thinking through a tool loop and
+            # the prompt stays the server's cached prefix. Encrypted reasoning
+            # (OpenAI's own models) has nothing a local model can read.
+            thought = "\n\n".join(part for part in (thought, reasoning_text(item)) if part)
+        # Hosted tool calls have nothing local to replay.
+    if system:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system)})
     chat = {"model": body.get("model"), "messages": messages}
-    tools, names = tools_for_chat(body.get("tools"))
     if tools:
         chat["tools"] = tools
         choice = body.get("tool_choice")
         if isinstance(choice, str):
             chat["tool_choice"] = choice
         elif isinstance(choice, dict) and choice.get("name"):
-            chat["tool_choice"] = {"type": "function", "function": {"name": flat_name(choice)}}
+            chat["tool_choice"] = {"type": "function", "function": {"name": flat_name(choice, back)}}
         if "parallel_tool_calls" in body:
             chat["parallel_tool_calls"] = body["parallel_tool_calls"]
     for ours, theirs in (("max_output_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p")):
@@ -181,12 +254,14 @@ def to_chat(body):
     return chat, names
 
 
-def call_item(call, names, index):
+def call_item(call, names):
     """A chat tool call as a Responses output item."""
     function = call.get("function") or {}
     flat = function.get("name") or ""
     kind, namespace, name = names.get(flat, ("function", None, flat))
-    call_id = call.get("id") or f"call_{index}"
+    # Some servers send no id; Codex matches outputs to calls by it, so it
+    # must differ from every earlier call in the conversation.
+    call_id = call.get("id") or new_call_id()
     if kind == "custom":
         try:
             value = json.loads(function.get("arguments") or "{}").get("input", "")
@@ -229,9 +304,9 @@ def response(model, output, status="completed", finish=None, used=None, ident=No
         "error": None,
         "incomplete_details": None,
     }
-    if finish == "length" and status == "completed":
+    if finish in INCOMPLETE and status == "completed":
         result["status"] = "incomplete"
-        result["incomplete_details"] = {"reason": "max_output_tokens"}
+        result["incomplete_details"] = {"reason": INCOMPLETE[finish]}
     return result
 
 
@@ -255,8 +330,8 @@ def from_chat(chat, model, names):
         output.append(reasoning_item(thought, "rs_0"))
     if message.get("content"):
         output.append(message_item(text_of(message["content"]), "msg_0"))
-    for index, call in enumerate(message.get("tool_calls") or ()):
-        output.append(call_item(call, names, index))
+    for call in message.get("tool_calls") or ():
+        output.append(call_item(call, names))
     return response(model, output, finish=choice.get("finish_reason"), used=usage(chat.get("usage")))
 
 
@@ -283,7 +358,7 @@ class StreamTranslator:
 
     def emit(self, kind, **fields):
         self.sequence += 1
-        return event(kind, sequence_number=self.sequence, **fields)
+        return event(kind, sequence_number=self.sequence - 1, **fields)
 
     def start(self):
         shell = response(self.model, [], status="in_progress", ident=self.ident)
@@ -358,10 +433,10 @@ class StreamTranslator:
                 if position not in self.calls:
                     # The chat names, kept to build the final item; the event
                     # shows the call as the agent named it.
-                    item = {"type": "call", "call_id": call.get("id") or f"call_{position}",
+                    item = {"type": "call", "call_id": call.get("id") or new_call_id(),
                             "name": function.get("name") or "", "arguments": ""}
                     shown = call_item({"id": item["call_id"], "function": {"name": item["name"]}},
-                                      self.names, position)
+                                      self.names)
                     item["id"], item["kind"] = shown["id"], shown["type"]
                     shown.update(status="in_progress", **({"arguments": ""} if "arguments" in shown else {"input": ""}))
                     self.output.append(item)
@@ -390,8 +465,10 @@ class StreamTranslator:
                          content_index=0, text=text) + self.emit(
             "response.output_item.done", output_index=index, item=reasoning_item(text, item["id"]))
 
-    def end(self):
-        """The closing events; response.failed when the stream was cut short."""
+    def end(self, error=None):
+        """The closing events: response.failed when the stream was cut short
+        (or broke: error says how), response.incomplete when the server
+        stopped the answer early, response.completed otherwise."""
         out = [self.close_thought()]
         final = []
         for index, item in enumerate(self.output):
@@ -411,7 +488,7 @@ class StreamTranslator:
             else:
                 done = call_item(
                     {"id": item["call_id"], "function": {"name": item["name"], "arguments": item["arguments"]}},
-                    self.names, index,
+                    self.names,
                 )
                 if done["type"] == "function_call":
                     out.append(self.emit("response.function_call_arguments.done", item_id=item["id"],
@@ -420,9 +497,14 @@ class StreamTranslator:
                 final.append(done)
         if not (self.done or self.finish):
             failed = response(self.model, final, status="failed", ident=self.ident)
-            failed["error"] = {"code": "server_error", "message": "the model server's stream ended early"}
+            failed["error"] = {"code": "server_error",
+                               "message": error or "the model server's stream ended early"}
             out.append(self.emit("response.failed", response=failed))
         else:
-            out.append(self.emit("response.completed", response=response(
-                self.model, final, finish=self.finish, used=self.used, ident=self.ident)))
+            # As the Responses API does: a reply cut off at max_output_tokens
+            # ends with response.incomplete. Codex then ends the turn with
+            # that reason and does not run a call whose arguments were cut.
+            last = response(self.model, final, finish=self.finish, used=self.used, ident=self.ident)
+            kind = "response.incomplete" if last["status"] == "incomplete" else "response.completed"
+            out.append(self.emit(kind, response=last))
         return b"".join(out)

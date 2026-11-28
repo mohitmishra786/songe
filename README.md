@@ -110,6 +110,10 @@ You need a model served locally, and an agent:
 | Agents | opencode and pi (set up for you); any OpenAI-compatible tool | opencode, pi |
 | Training | Apple Silicon (MLX); NVIDIA and AMD (PyTorch) | Apple Silicon, NVIDIA |
 
+Machines without a GPU still serve and record, but do not train.
+Tried Songe on another setup? Share the result on the
+[testing board](https://github.com/sous-labs/songe/issues/15).
+
 Codex CLI speaks only the Responses API, which Songe also serves. `songe
 init` does not set it up yet; add this to `~/.codex/config.toml`:
 
@@ -121,10 +125,6 @@ model_provider = "songe"
 name = "Songe"
 base_url = "http://127.0.0.1:7613/v1"
 ```
-
-Machines without a GPU still serve and record, but do not train.
-Tried Songe on another setup? Share the result on the
-[testing board](https://github.com/sous-labs/songe/issues/15).
 </details>
 
 ## 🌙 How it works
